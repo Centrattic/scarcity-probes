@@ -1,113 +1,234 @@
-End‑to‑end pipeline for training *attention probes* on GPT‑2‑medium using
-[Transformer Lens](https://github.com/neelnanda‑io/TransformerLens).
 
-The implementation follows two recent works:
+# Evaluating Probes: Training Reliable Activation Probes with Few Positive Examples
 
-* **Sparse‑Autoencoder (SAE) Probe Benchmarks** – we restrict training to
-  the binary‑classification datasets listed in Table 3 of *Are Sparse
-  Autoencoders Useful? A Case Study in Sparse Probing* and (optionally)
-  filter to those where a *linear last‑token probe* achieves **< 0.8 AUC**
-  under standard conditionsfileciteturn1file11L17-L24.
+This codebase accompanies the paper [Training Reliable Activation Probes With a Handful of Positive Examples](https://openreview.net/forum?id=punokGGd4V) (NeurIPS 2025 MechInterp Workshop).
 
-* **Sentinel (2025)** – we extract the **last‑token, last‑layer decoder
-  attention** pattern A ∈ ℝ<sup>H×T</sup> and build fixed‑length features by
-  averaging attention weights over the input tokens, exactly as described
-  in §2.2 of Sentinel (“We extract the attention tensor … from the final
-  decoder token” and average over tokens)fileciteturn2file4L17-L34.
+## TL;DR
+
+Monitoring advanced AI for rare misalignments faces a data challenge: abundant aligned examples but only a handful of misaligned ones. We test activation probes in this "few vs. thousands" regime on spam and honesty detection tasks.
+
+Key findings:
+- Training with many negative examples is more positive-sample-efficient than balanced training for small numbers (1-10) of positive samples
+- LLM upsampling can provide a performance boost equivalent to roughly doubling the number of real positive samples
+- Larger models are more positive-sample-efficient to probe
+
+## Installation
+
+```bash
+git clone <repo-url>
+cd evaluating-probes
+pip install -r requirements.txt
+```
+
+Create a `.env` file in the repo root with your configuration:
+
+```bash
+OPENAI_API_KEY=your_key_here  # Required for LLM upsampling experiments
+EP_CPU_NJOBS=15               # Number of parallel CPU jobs
+EP_GPU_NJOBS=1                # Number of parallel GPU jobs
+```
+
+## Configuration
+
+Experiments are defined in YAML config files in `configs/`. Each config specifies:
+
+```yaml
+run_name: "spam_gemma_9b"
+model_name: "google/gemma-2-9b"
+device: "cuda:0"
+cache_activations: True
+log_file: "logs/spam_exp_gpu.log"
+seeds: [42, 43, 44, 45, 46]  # Multiple seeds for variance estimation
+layers: [20]                  # Which layers to extract activations from
+components:
+  - "resid_post"              # Residual stream after layer
+```
+
+To specify activations extraction methodology:
+
+```yaml
+activation_extraction:
+  format_type: "qr"           # Options: "qr" (on-policy), "r" (off-policy instruct), "r-no-it" (off-policy non-instruct)
+```
+
+Each config contains experiments, which specify training data, evaluation data, and optional class imbalance configurations:
+
+```yaml
+experiments:
+  - name: 1-spam-pred-auc
+    class_names: {0: "Ham", 1: "Spam"}
+    train_on: 94_better_spam
+    evaluate_on:
+      - 94_better_spam
+      - 87_is_spam
+```
+The `rebuild_config` section defines how to construct imbalanced training sets:
+
+```yaml
+rebuild_config:
+  increasing_spam_fixed_total:
+    - {class_counts: {0: 1750, 1: 1}}   # 1750 negatives, 1 positive
+    - {class_counts: {0: 1750, 1: 5}}   # 1750 negatives, 5 positives
+    - {class_counts: {0: 1750, 1: 10}}  # 1750 negatives, 10 positives
+```
+
+You can also specify LLM upsampling settings:
+
+```yaml
+rebuild_config:
+  llm_upsampling_experiments:
+    - {llm_upsampling: True, n_real_neg: 1750, n_real_pos: 10, upsampling_factor: 5}
+```
+
+This creates 50 synthetic positives (10 real × 5 upsampling factor) in addition to the 10 real positives.
+
+## Probe Architectures
+
+Next, you must specify probe architectures in the main config. This project supports six probe architectures. For each probe, all hyperparameters are defined in `configs/probes.py`. Each probe (except the attention probe) supports four aggregation methods: `mean`, `max`, `last`, `softmax`
+
+### Linear Probe (sklearn)
+Standard logistic regression on aggregated activations; very fast to train.
+
+```yaml
+architectures:
+  - name: "sklearn_linear_mean"
+    config_name: "sklearn_linear_mean"
+```
+
+### Attention Probe (PyTorch)
+Learned attention over sequence positions, then linear classification. Trains on full sequences without pre-aggregation.
+
+```yaml
+architectures:
+  - name: "attention"
+    config_name: "attention"
+```
+
+### SAE Probe
+Uses pre-trained Sparse Autoencoders (from SAE lens or Hugging Face) to encode activations, then trains a linear classifier on selected SAE features.
+
+```yaml
+architectures:
+  - name: "sae_16k_l0_408_mean"
+    config_name: "sae_16k_l0_408_mean"
+```
+
+### Mass Mean Probe
+Non-trainable probe that computes the direction between class means (positive minus negative).
+
+```yaml
+architectures:
+  - name: "mass_mean"
+    config_name: "mass_mean"
+```
+
+### Activation Similarity Probe
+Non-trainable probe that classifies based on cosine similarity to class centroids.
+
+```yaml
+architectures:
+  - name: "act_sim_mean"
+    config_name: "act_sim_mean"
+```
+
+## Running Experiments
+
+After you've created your config, running experiments is simple!
+
+### Basic Usage
+
+```bash
+python -m src.main -c gemma_spam_gpu
+```
+
+This loads `configs/gemma_spam_gpu_config.yaml` and runs all specified experiments. Some key flags here are:
+- `-c CONFIG`: Config file name (without `_config.yaml` suffix)
+- `--rerun`: Rerun all probes from scratch, bypassing cached results
+
+### What Happens
+
+1. **Model check** (off-policy only): Verify the model can solve the task before probing
+2. **LLM upsampling** (if configured): Generate synthetic examples
+3. **Activation extraction**: Cache activations for all datasets/layers
+4. **Probe training**: Train all probe architectures across seeds and class imbalance configs
+5. **Evaluation**: Evaluate on validation, test, and generalization sets
+
+Results are saved to `results/{run_name}/`.
+
+### Example Configs
+
+For spam detection with Gemma-2-9b:
+```bash
+python -m src.main -c gemma_spam_gpu
+```
+
+For honesty detection with Llama-3.3-70B:
+```bash
+python -m src.main -c llama_mask_gpu
+```
+
+For Qwen-3 scaling experiments:
+```bash
+python -m src.main -c qwen_0.6b_gpu
+python -m src.main -c qwen_1.7b_gpu
+python -m src.main -c qwen_4b_gpu
+python -m src.main -c qwen_8b_gpu
+python -m src.main -c qwen_14b_gpu
+```
 
 ## Datasets
 
-- Each dataset is listed in the CSV `dataset\main.csv`. Adding new datasets is quite simple. The datasets schema matches that defined in [SAE probes](https://github.com/JoshEngels/SAE-Probes/tree/main)
+We evaluate on two binary classification tasks:
 
-1. Add your raw CSV file to the source folder.
-2. Add a row to the index CSV with:
-   - New number,
-   - `source` (filename),
-   - `Probe from` and `Probe to` (the column names)
-   - Extraction methods: `col` for direct select of col as a Pandas Series, or Series methods like `col == 1`, `col.str.contains(...)` which will be evaled directly.
-3. Run the script to generate cleaned output in the target folder.
+### Spam Detection (off-policy)
+- `94_better_spam`: Primary spam detection dataset
+- `87_is_spam`: Generalization test set
 
+These are off-policy datasets where the model itself didn't generate the text.
 
-## Probing
+### Honesty Detection (on-policy, MASK benchmark)
+- `98_mask_all_honesty`: Combined honesty detection from the MASK benchmark
+- `99_mask_continuations_honesty`: Continuation-based honesty
+- `100_mask_disinformation_honesty`: Disinformation detection
+- `101_mask_doubling_down_honesty`: Doubling-down behavior
+- `102_mask_known_facts_honesty`: Known facts honesty
+- `103_mask_provided_facts_honesty`: Provided facts honesty
+- `104_mask_statistics_honesty`: Statistics honesty
 
-This module is **model‑agnostic** – you only pass in numpy / torch
-matrices that you have already extracted with a TransformerLens hook.
-It currently implements two probe families:
+These are on-policy datasets where probes are trained on the model's own activations when generating text.
 
-1. *Logistic Regression Probe* (linear‑in‑features classifier)
-2. *Mass‑Mean Probe* (mean‑difference direction with optional LDA tilt)
+### Adding New Datasets
 
-Both probes share the same public interface:
+Datasets are indexed in `datasets/main.csv`. To add a new dataset:
+1. Add your CSV file to `datasets/original/`
+2. Add a row to `datasets/main.csv` with the source filename, probe columns, and extraction method
+3. Run the cleaning script to generate cleaned output
+## Results Structure
 
 ```
-probe = SomeProbe(**hyperparams)
-probe.fit(X_train, y_train)          # mandatory
-scores = probe.score(X_test, y_test) # returns dict of metrics
-preds  = probe.predict(X_test)       # logits or class probs
+results/{run_name}/
+├── seed_42/
+│   ├── 1-spam-pred-auc/
+│   │   ├── trained/           # Saved probe states
+│   │   ├── val_eval/          # Validation set results
+│   │   ├── test_eval/         # Test set results (same dataset)
+│   │   └── gen_eval/          # Generalization results (different datasets)
+│   └── 2-spam-pred-auc-increasing-spam/
+│       └── ...
+├── seed_43/
+│   └── ...
+└── output.log
 ```
 
-`X_*` should be 2‑D: **(samples, features)**. If you start with
-(sequence, hidden_size) tensors you must flatten/aggregate first – the
-helper in `extract.py` does this for you.
+Each evaluation directory contains JSON files with metrics (AUC, accuracy, precision, recall, FPR) for each probe configuration.
 
-You may freely modify / extend the hyperparameters.  See the README for
-examples.
+## Citation
 
-# Viewing the visualizations
-
-Run ```python -m http.server``` in the ```evaluating-probes/interpretability``` directory.
-
-
-### RunPod Access: 
-https://github.com/Stefan-Heimersheim/runpod_cli/
-
-### Running Notes:
-
-* Rewrite aggregation code to actually properly aggregate only up to the proper sequence length if specified. If you don't, single all will be messed with (other datasets have probes trained up to their max len or smt smt)
-- there is even a lot of variance in length across dataset which I am unclear-ish on how to handle
-
-* skipping meta probe for now, since need more compute to train (working on getting this)
-
-* to make activation loading faster, chunk by like batches as well, like sizes of 1000 points or something, or actually just by train and test set. That way when loading test you dont have to load all activations from train too and then select.
-
-* Integrate https://github.com/Lightning-AI/pytorch-lightning
-
-* add flags to main to overwrite existing training, and/or existing evaluations
-* automatically store datasets in S3 bucket
-* debug getting things to run on CUDA 1 SOBBB
-* evntually add model check and dataset sizing as flags to the overall main for convenience, and for ease of running experiments in the future
-
-## Memory tips
-* dont drag grads too far (torch.nograd, also loss.item() vs loss), dont keep grads around
-* small batch size
-* that shit
-* del model from cuda at the end of every using it, and clear cache, try to clear gpu entirely so it doesnt hold old stuffs
-* make test size something you pass in during experiment config? Either way, test size being manually coded at 0.15 everywhere seems bad, wehn i can pass it into places. Perhaps just have main variable with test size written. Somehow need to make this generalize nicely to french dataset 
-* figure out how to properly run on cuda:1
-* add filtered threshold 
-* if i dont pass train flag and some of the probes are untrained why does it skip those?? idkkk oh it skips running train for that set, including rebuild ocnfig. So either have to skip all rebuild config or not. Should figure out what is best here, probably fix this. 
-* change model_check to just be 1 file instead of a module
-* make config for dataclass exps much cleaner, it must have categories for the three sorts of dataclass exps so its much easier to plot
-
-
-Reminder that: 
-
-how best to handle default values in my Python methods???
-thoughts
-like my top method has default and lower level method it calls has default too
-probably should only set my defaults in top method
-OHH
-in methods im going to call directly -- not helper methods really i dont need to
-ALSO use the defaults when calling the method, don't rewrite batch_size=200 or something if thats the default
-cuz if u change it, it's annoying
-
-
-UNDERSTAND THIS: 
-* why is train + test together for 4_hist_fig_ismale 36941, but cache only saves like 36916 hashes or something? There is some train-test overlap -- if so, this is weird!!
-- fixed with duplicate prompt removal 
-
-* there appear to be exactly 2 datapoints that are hash duplicates in french set
-
-
-* make it such that it's possible to hyperparam tune some probes but not all your probes or something. For now, I can just change experiment details or something like that.
-* small fix so that if you don't specify -t or -e flags, and stuff alrady exsits, the model shouldn't be loaded. Like load in train or eval or smt ig?
+```bibtex
+@inproceedings{tyagi2025probes,
+  title={Training Reliable Activation Probes With a Handful of Positive Examples},
+  author={Tyagi, Riya and Heimersheim, Stefan},
+  booktitle={NeurIPS 2025 Workshop on Mechanistic Interpretability},
+  year={2025}
+}
+```
