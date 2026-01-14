@@ -11,5 +11,7 @@ runpod_cli/*
 evaluating-probes/src/.ipynb_checkpoints/*
 .env
 evaluating-probes/logs
-evaluating-probes/mask/* 
-evaluating-probes/sae_cache/*
+evaluating-probes/mask/*
+evaluating-probes/sae_cache/
+evaluating-probes/visualizations*/
+evaluating-probes/results/
